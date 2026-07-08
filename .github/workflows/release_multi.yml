@@ -1,4 +1,4 @@
-name: Go_Release
+name: Go_Release_Multi
 
 on:
   workflow_dispatch:
