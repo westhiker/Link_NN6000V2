@@ -1,0 +1,269 @@
+name: Go_Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      pppoe_username:
+        description: 'PPPoE 宽带账号 (留空使用默认值 "-")'
+        required: false
+        default: '-'
+      pppoe_password:
+        description: 'PPPoE 宽带密码 (留空使用默认值 "-")'
+        required: false
+        default: '-'
+
+  schedule:
+    - cron: '0 20 */3 * *'
+
+env:
+  DEVICES: "link_nn6000v2_immwrt zn_m2_immwrt"
+  REPO_URL: https://github.com/VIKINGYFY/immortalwrt.git
+  REPO_BRANCH: main
+  BUILD_DIR: imm-nss
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6.0.2
+
+      - name: Build System Setup
+        run: |
+          echo "=== Disk Space Before Cleanup ==="
+          df -h
+
+          sudo apt-get purge -y \
+            dotnet* \
+            ghc* \
+            libboost* \
+            android* \
+            swift* \
+            chromium* \
+            chrome* \
+            firefox* \
+            ffmpeg* \
+            powershell* \
+            codeql* \
+            microsoft* \
+            || true
+
+          sudo apt-get autoremove -y --purge
+          sudo docker system prune -a -f 2>/dev/null || true
+          sudo rm -rf /var/lib/apt/lists/*
+
+          echo "=== Disk Space After Cleanup ==="
+          df -h
+
+          sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
+
+          sudo -E apt -yqq install dos2unix libfuse-dev
+          sudo -E apt -yqq autoremove --purge
+          sudo -E apt -yqq autoclean
+          sudo -E apt -yqq clean
+          sudo rm -rf /var/lib/apt/lists/*
+          sudo -E systemctl daemon-reload
+
+          echo "=== Final Disk Space ==="
+          df -h
+
+      - name: Set Build Date and Timezone
+        run: |
+          sudo -E timedatectl set-timezone "Asia/Shanghai"
+          BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d_%H.%M.%S")
+          echo "BUILD_DATE=$BUILD_DATE" >> $GITHUB_ENV
+          echo "BUILD_SRC=${{ env.REPO_URL }}" >> $GITHUB_ENV
+
+      - name: Clone Source Code
+        run: |
+          chmod +x ./nn6000v2/scripts/update.sh
+          chmod +x ./nn6000v2/scripts/build.sh
+
+          echo "克隆仓库：${{ env.REPO_URL }} 分支：${{ env.REPO_BRANCH }}"
+          git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} ./action_build
+
+          cd ./action_build
+          git rev-parse HEAD > ../repo_flag
+          cd ..
+
+          PROJECT_MIRRORS_FILE="./action_build/scripts/projectsmirrors.json"
+          if [ -f "$PROJECT_MIRRORS_FILE" ]; then
+            sed -i '/.cn\//d; /tencent/d; /aliyun/d' "$PROJECT_MIRRORS_FILE"
+          fi
+
+      - name: Restore Build Dependencies Cache
+        uses: actions/cache/restore@v5.0.4
+        with:
+          path: |
+            ./action_build/.ccache
+            ./action_build/staging_dir
+          key: ${{ runner.os }}-${{ hashFiles('repo_flag') }}
+          restore-keys: |
+            ${{ runner.os }}-
+
+      - name: Refresh the cache
+        run: |
+          if [ -d "./action_build/staging_dir" ]; then
+            find "./action_build/staging_dir" -type d -name "stamp" -not -path "*target*" | while read -r dir; do
+              find "$dir" -type f -exec touch {} +
+            done
+          fi
+
+      - name: Build Firmware
+        run: |
+          PPPOE_USER="${{ github.event.inputs.pppoe_username || '-' }}"
+          PPPOE_PASS="${{ github.event.inputs.pppoe_password || '-' }}"
+
+          if [ "$PPPOE_USER" != "-" ] || [ "$PPPOE_PASS" != "-" ]; then
+            echo "正在配置 PPPoE 账号密码..."
+            sed -i "s#^PPPOE_USERNAME=.*#PPPOE_USERNAME=\"$PPPOE_USER\"#" ./nn6000v2/patches/992_network_config.sh
+            sed -i "s#^PPPOE_PASSWORD=.*#PPPOE_PASSWORD=\"$PPPOE_PASS\"#" ./nn6000v2/patches/992_network_config.sh
+            echo "PPPoE Username: $PPPOE_USER"
+            echo "PPPoE Password: [HIDDEN]"
+          else
+            echo "未输入 PPPoE 账号密码，使用默认值 '-'"
+          fi
+
+          rm -rf ./firmware
+          mkdir -p ./firmware
+
+          for DEV in $DEVICES; do
+            echo "=============================================="
+            echo "开始编译设备：$DEV"
+            echo "=============================================="
+
+            SKIP_CLEAN=1 ./nn6000v2/scripts/build.sh "$DEV"
+
+            OUT_DIR="./firmware/$DEV"
+            mkdir -p "$OUT_DIR"
+
+            TARGET_DIR="./action_build/bin/targets"
+            find "$TARGET_DIR" -type f \( \
+              -name "*.bin" \
+              -o -name "*.manifest" \
+              -o -name "*.img.gz" \
+              -o -name "*.itb" \
+              -o -name "*.fip" \
+              -o -name "*.ubi" \
+              -o -name "*rootfs.tar.gz" \
+            \) -exec cp -f {} "$OUT_DIR/" \;
+
+            echo "设备 $DEV 编译完成，产物："
+            ls -lh "$OUT_DIR" || true
+          done
+
+          FIRST_MANIFEST=$(find ./firmware -name "immortalwrt-*.manifest" | head -1)
+          if [ -n "$FIRST_MANIFEST" ]; then
+            KVER=$(grep "^kernel " "$FIRST_MANIFEST" | grep -oE "[4-6]\.[0-9]+\.[0-9]+" | head -1 || echo "")
+            echo "KVER=${KVER:-unknown}" >> $GITHUB_ENV
+          else
+            echo "KVER=unknown" >> $GITHUB_ENV
+          fi
+
+      - name: Cleanup Old Cache
+        continue-on-error: true
+        run: |
+          echo "=== Cleaning up old caches ==="
+          gh cache list || true
+
+          CACHE_PREFIX="${{ runner.os }}-"
+          MATCHING_CACHES=$(gh cache list --json key --jq '.[].key' 2>/dev/null | grep "^${CACHE_PREFIX}" || true)
+
+          if [ -n "$MATCHING_CACHES" ]; then
+            echo "$MATCHING_CACHES" | while IFS= read -r key; do
+              if [ -n "$key" ]; then
+                echo "Deleting cache: $key"
+                gh cache delete "$key" || true
+              fi
+            done
+          else
+            echo "No matching caches found."
+          fi
+
+          echo "ccache: $(du -sh ./action_build/.ccache 2>/dev/null | cut -f 1 || echo 'N/A')"
+          echo "staging: $(du -sh ./action_build/staging_dir 2>/dev/null | cut -f 1 || echo 'N/A')"
+
+      - name: Save Build Dependencies Cache
+        uses: actions/cache/save@v5.0.4
+        with:
+          path: |
+            ./action_build/.ccache
+            ./action_build/staging_dir
+          key: ${{ runner.os }}-${{ hashFiles('repo_flag') }}
+
+      - name: Machine Information
+        run: |
+          echo "=============================================="
+          lscpu | grep -E "name|Core|Thread" || true
+          echo "=============================================="
+          df -h
+          echo "=============================================="
+
+      - name: Prepare Release Body
+        run: |
+          {
+            echo "## 版本信息"
+            echo "- 设备：${{ env.DEVICES }}"
+            echo "- 源码：${{ env.BUILD_SRC }}"
+            echo "- Kernel: ${{ env.KVER }}"
+            echo "- WIFI 密码：147258369"
+            echo "- LAN 地址：10.0.0.1"
+            echo "- 账户：root"
+            echo "- 密码：无"
+            echo "- no_wifi 后缀的版本未包含 WIFI 驱动程序"
+          } > release_body.txt
+
+      - name: Release Firmware
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.BUILD_DATE }}_multi
+          name: ${{ env.BUILD_DATE }} multi-device
+          files: |
+            ./firmware/**/*.bin
+            ./firmware/**/*.manifest
+            ./firmware/**/*.img.gz
+            ./firmware/**/*.itb
+            ./firmware/**/*.fip
+            ./firmware/**/*.ubi
+            ./firmware/**/*rootfs.tar.gz
+          body_path: ./release_body.txt
+          make_latest: true
+
+      - name: Cleanup Old Versions
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=========================================="
+          echo "开始清理旧版本..."
+          echo "=========================================="
+
+          echo "所有 Releases 列表:"
+          gh release list --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[] | {tagName: .tagName, createdAt: .createdAt}' || true
+
+          RELEASES=$(gh release list --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].tagName' || true)
+
+          if [ -z "$RELEASES" ]; then
+            echo "无需清理 Release"
+          else
+            echo "$RELEASES" | while read -r tag; do
+              if [ -n "$tag" ]; then
+                echo "删除：$tag"
+                gh release delete "$tag" --cleanup-tag --yes 2>/dev/null || true
+              fi
+            done
+          fi
+
+          echo "清理旧的工作流运行记录..."
+          gh run list --workflow release.yml --json databaseId,createdAt --jq 'sort_by(.createdAt) | reverse | .[2:] | .[].databaseId' | while read -r run_id; do
+            if [ -n "$run_id" ]; then
+              echo "删除工作流运行记录：$run_id"
+              gh run delete "$run_id" 2>/dev/null || true
+            fi
+          done
