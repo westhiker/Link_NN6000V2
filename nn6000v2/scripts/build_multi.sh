@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 if [ -d "nn6000v2" ]; then
   NN6000V2_PATH="nn6000v2"
@@ -10,138 +10,190 @@ else
   exit 1
 fi
 
-BASE_PATH=$(cd "$NN6000V2_PATH" && pwd)
+BASE_PATH="$(cd "$NN6000V2_PATH" && pwd)"
+ROOT_PATH="$(cd "$BASE_PATH/.." && pwd)"
 
-Dev=$1
-Build_Mod=$2
+REPO_URL="${REPO_URL:-https://github.com/VIKINGYFY/immortalwrt.git}"
+REPO_BRANCH="${REPO_BRANCH:-main}"
+BUILD_DIR="${BUILD_DIR:-action_build}"
+COMMIT_HASH="${COMMIT_HASH:-none}"
 
-CONFIG_FILE="$BASE_PATH/configs/$Dev.config"
+BUILD_PATH="$ROOT_PATH/$BUILD_DIR"
+FIRMWARE_PATH="$ROOT_PATH/firmware"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "Config not found: $CONFIG_FILE"
+if [ "$#" -lt 1 ]; then
+  echo "Usage: $0 <device1> [device2] ..."
   exit 1
 fi
 
-REPO_URL=${REPO_URL:-https://github.com/VIKINGYFY/immortalwrt.git}
-REPO_BRANCH=${REPO_BRANCH:-main}
-BUILD_DIR=${BUILD_DIR:-imm-nss}
-COMMIT_HASH=${COMMIT_HASH:-none}
+DEVICES=("$@")
 
-if [[ -d action_build ]]; then
-  BUILD_DIR="action_build"
+if [ ! -d "$BUILD_PATH" ]; then
+  "$BASE_PATH/scripts/update.sh" "$REPO_URL" "$REPO_BRANCH" "$BUILD_DIR" "$COMMIT_HASH"
 fi
 
 remove_uhttpd_dependency() {
-  local config_path="$BASE_PATH/../$BUILD_DIR/.config"
-  local luci_makefile_path="$BASE_PATH/../$BUILD_DIR/feeds/luci/collections/luci/Makefile"
+  local config_path="$BUILD_PATH/.config"
+  local luci_makefile_path="$BUILD_PATH/feeds/luci/collections/luci/Makefile"
 
   if grep -q "CONFIG_PACKAGE_luci-app-quickfile=y" "$config_path"; then
     if [ -f "$luci_makefile_path" ]; then
       sed -i '/luci-light/d' "$luci_makefile_path"
-      echo "Removed uhttpd (luci-light) dependency as luci-app-quickfile (nginx) is enabled."
+      echo "Removed uhttpd/luci-light dependency."
     fi
   fi
 }
 
 apply_config() {
-  cp -f "$CONFIG_FILE" "$BASE_PATH/../$BUILD_DIR/.config"
-  cat "$BASE_PATH/configs/docker_deps.config" >> "$BASE_PATH/../$BUILD_DIR/.config"
+  local dev="$1"
+  local config_file="$BASE_PATH/configs/$dev.config"
+
+  if [ ! -f "$config_file" ]; then
+    echo "Config not found: $config_file"
+    exit 1
+  fi
+
+  cp -f "$config_file" "$BUILD_PATH/.config"
+
+  if [ -f "$BASE_PATH/configs/docker_deps.config" ]; then
+    cat "$BASE_PATH/configs/docker_deps.config" >> "$BUILD_PATH/.config"
+  fi
 }
 
 fix_netfilter_kmod_clash() {
-  local include_netfilter_mk="$BASE_PATH/../$BUILD_DIR/include/netfilter.mk"
-  local netfilter_mk="$BASE_PATH/../$BUILD_DIR/package/kernel/linux/modules/netfilter.mk"
+  local include_netfilter_mk="$BUILD_PATH/include/netfilter.mk"
+  local netfilter_mk="$BUILD_PATH/package/kernel/linux/modules/netfilter.mk"
 
-  if [ ! -f "$include_netfilter_mk" ]; then
-    echo "Netfilter include file not found: $include_netfilter_mk" >&2
-    return 1
-  fi
+  [ -f "$include_netfilter_mk" ] || return 0
+  [ -f "$netfilter_mk" ] || return 0
 
-  if [ ! -f "$netfilter_mk" ]; then
-    echo "Netfilter makefile not found: $netfilter_mk" >&2
-    return 1
-  fi
-
-  if grep -q 'CONFIG_IP_NF_IPTABLES_LEGACY, $(P_V4)ip_tables, ge 6.12' "$include_netfilter_mk" && \
-     grep -q 'CONFIG_IP6_NF_IPTABLES_LEGACY, $(P_V6)ip6_tables, ge 6.12' "$include_netfilter_mk" && \
-     grep -q 'DEPENDS:=+(!(LINUX_6_12||LINUX_6_18)):kmod-iptables' "$netfilter_mk"; then
-    echo "Netfilter kmod clash workaround already applied"
+  if grep -q 'CONFIG_IP_NF_IPTABLES_LEGACY, $(P_V4)ip_tables, ge 6.12' "$include_netfilter_mk"; then
+    echo "Netfilter workaround already applied."
     return 0
   fi
 
-  if grep -q '$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables),))' "$include_netfilter_mk"; then
-    echo "Updating NF_IPT mapping for Linux 6.12/6.18..."
-    sed -i 's@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables),))@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables, lt 6.12),))@' "$include_netfilter_mk"
-    sed -i '/CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables, lt 6\.12)/a$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES_LEGACY, $(P_V4)ip_tables, ge 6.12),))' "$include_netfilter_mk"
-  fi
+  sed -i 's@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables),))@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables, lt 6.12),))@' "$include_netfilter_mk" || true
+  sed -i '/CONFIG_IP_NF_IPTABLES, $(P_V4)ip_tables, lt 6\.12)/a$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT,CONFIG_IP_NF_IPTABLES_LEGACY, $(P_V4)ip_tables, ge 6.12),))' "$include_netfilter_mk" || true
 
-  if grep -q '$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET)))' "$include_netfilter_mk"; then
-    echo "Updating IPT_CORE userland mapping for Linux 6.12/6.18..."
-    sed -i 's@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET)))@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, lt 6.12)))@' "$include_netfilter_mk"
-    sed -i '/CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, lt 6\.12))/a$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES_LEGACY, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, ge 6.12)))' "$include_netfilter_mk"
-  fi
+  sed -i 's@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET)))@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, lt 6.12)))@' "$include_netfilter_mk" || true
+  sed -i '/CONFIG_IP_NF_IPTABLES, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, lt 6\.12))/a$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_CORE,CONFIG_IP_NF_IPTABLES_LEGACY, xt_standard ipt_icmp xt_tcp xt_udp xt_comment xt_set xt_SET, ge 6.12)))' "$include_netfilter_mk" || true
 
-  if grep -q '$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables),))' "$include_netfilter_mk"; then
-    echo "Updating NF_IPT6 mapping for Linux 6.12/6.18..."
-    sed -i 's@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables),))@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables, lt 6.12),))@' "$include_netfilter_mk"
-    sed -i '/CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables, lt 6\.12)/a$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES_LEGACY, $(P_V6)ip6_tables, ge 6.12),))' "$include_netfilter_mk"
-  fi
+  sed -i 's@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables),))@$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables, lt 6.12),))@' "$include_netfilter_mk" || true
+  sed -i '/CONFIG_IP6_NF_IPTABLES, $(P_V6)ip6_tables, lt 6\.12)/a$(eval $(if $(NF_KMOD),$(call nf_add,NF_IPT6,CONFIG_IP6_NF_IPTABLES_LEGACY, $(P_V6)ip6_tables, ge 6.12),))' "$include_netfilter_mk" || true
 
-  if grep -q '$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES, ip6t_icmp6)))' "$include_netfilter_mk"; then
-    echo "Updating IPT_IPV6 userland mapping for Linux 6.12/6.18..."
-    sed -i 's@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES, ip6t_icmp6)))@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES, ip6t_icmp6, lt 6.12)))@' "$include_netfilter_mk"
-    sed -i '/CONFIG_IP6_NF_IPTABLES, ip6t_icmp6, lt 6\.12))/a$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES_LEGACY, ip6t_icmp6, ge 6.12)))' "$include_netfilter_mk"
-  fi
+  sed -i 's@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES, ip6t_icmp6)))@$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES, ip6t_icmp6, lt 6.12)))@' "$include_netfilter_mk" || true
+  sed -i '/CONFIG_IP6_NF_IPTABLES, ip6t_icmp6, lt 6\.12))/a$(eval $(if $(NF_KMOD),,$(call nf_add,IPT_IPV6,CONFIG_IP6_NF_IPTABLES_LEGACY, ip6t_icmp6, ge 6.12)))' "$include_netfilter_mk" || true
 
-  if grep -q 'DEPENDS:=+!LINUX_6_12:kmod-iptables' "$netfilter_mk"; then
-    echo "Applying netfilter kmod clash workaround for Linux 6.12/6.18..."
-    sed -i 's/DEPENDS:=+!LINUX_6_12:kmod-iptables/DEPENDS:=+(!(LINUX_6_12||LINUX_6_18)):kmod-iptables/' "$netfilter_mk"
-  fi
+  sed -i 's/DEPENDS:=+!LINUX_6_12:kmod-iptables/DEPENDS:=+(!(LINUX_6_12||LINUX_6_18)):kmod-iptables/' "$netfilter_mk" || true
 
-  echo "Netfilter kmod clash workaround applied successfully"
+  echo "Netfilter workaround applied."
 }
 
 modify_kernel_size() {
-  local ipq60xx_mk_path="$BASE_PATH/../$BUILD_DIR/target/linux/qualcommax/image/ipq60xx.mk"
+  local ipq60xx_mk_path="$BUILD_PATH/target/linux/qualcommax/image/ipq60xx.mk"
 
   if [ -f "$ipq60xx_mk_path" ]; then
     sed -i '/link_nn6000-common/,/endef/{s/KERNEL_SIZE := 6144k/KERNEL_SIZE := 12288k/g}' "$ipq60xx_mk_path"
-    echo "Updated KERNEL_SIZE to 12288k (12MB) for link_nn6000 devices"
+    echo "Updated KERNEL_SIZE to 12288k for link_nn6000 devices."
   fi
 }
 
-"$BASE_PATH/scripts/update.sh" "$REPO_URL" "$REPO_BRANCH" "$BUILD_DIR" "$COMMIT_HASH"
+clean_target_output() {
+  local target_dir="$BUILD_PATH/bin/targets"
 
-apply_config
-fix_netfilter_kmod_clash
-remove_uhttpd_dependency
-modify_kernel_size
+  if [ -d "$target_dir" ]; then
+    find "$target_dir" -type f \( \
+      -name "*.bin" \
+      -o -name "*.manifest" \
+      -o -name "*.img.gz" \
+      -o -name "*.itb" \
+      -o -name "*.fip" \
+      -o -name "*.ubi" \
+      -o -name "*rootfs.tar.gz" \
+    \) -delete
+  fi
+}
 
-cd "$BASE_PATH/../$BUILD_DIR"
+copy_firmware() {
+  local dev="$1"
+  local out_dir="$FIRMWARE_PATH/$dev"
 
-make defconfig
+  mkdir -p "$out_dir"
 
-if [[ "$Build_Mod" == "debug" ]]; then
-  exit 0
-fi
-
-TARGET_DIR="$BASE_PATH/../$BUILD_DIR/bin/targets"
-
-if [[ -d "$TARGET_DIR" ]]; then
-  find "$TARGET_DIR" -type f \( \
+  find "$BUILD_PATH/bin/targets" -type f \( \
     -name "*.bin" \
     -o -name "*.manifest" \
-    -o -name "*efi.img.gz" \
+    -o -name "*.img.gz" \
     -o -name "*.itb" \
     -o -name "*.fip" \
     -o -name "*.ubi" \
     -o -name "*rootfs.tar.gz" \
-  \) -exec rm -f {} +
-fi
+  \) -exec cp -f {} "$out_dir/" \;
 
-make download -j"$(($(nproc) * 2))"
-make -j"$(($(nproc) + 1))" || make -j1 V=s
+  echo "Firmware for $dev:"
+  ls -lh "$out_dir" || true
+}
 
-if [[ -d "$BASE_PATH/../action_build" && "${SKIP_CLEAN:-0}" != "1" ]]; then
-  make clean
-fi
+build_first_device() {
+  local dev="$1"
+
+  echo "=============================================="
+  echo "Full build: $dev"
+  echo "=============================================="
+
+  apply_config "$dev"
+  fix_netfilter_kmod_clash
+  remove_uhttpd_dependency
+  modify_kernel_size
+
+  cd "$BUILD_PATH"
+  make defconfig
+
+  clean_target_output
+
+  make download -j"$(($(nproc) * 2))"
+  make -j"$(($(nproc) + 1))" || make -j1 V=s
+
+  copy_firmware "$dev"
+}
+
+build_next_device_image_only() {
+  local dev="$1"
+
+  echo "=============================================="
+  echo "Image-only build: $dev"
+  echo "=============================================="
+
+  apply_config "$dev"
+  fix_netfilter_kmod_clash
+  remove_uhttpd_dependency
+  modify_kernel_size
+
+  cd "$BUILD_PATH"
+  make defconfig
+
+  clean_target_output
+
+  make target/linux/clean
+  make target/linux/compile -j"$(($(nproc) + 1))" || make target/linux/compile V=s
+  make target/install -j"$(($(nproc) + 1))" || make target/install V=s
+
+  copy_firmware "$dev"
+}
+
+rm -rf "$FIRMWARE_PATH"
+mkdir -p "$FIRMWARE_PATH"
+
+FIRST=1
+
+for DEV in "${DEVICES[@]}"; do
+  if [ "$FIRST" = "1" ]; then
+    build_first_device "$DEV"
+    FIRST=0
+  else
+    build_next_device_image_only "$DEV"
+  fi
+done
+
+echo "All devices finished."
+find "$FIRMWARE_PATH" -maxdepth 2 -type f -print
