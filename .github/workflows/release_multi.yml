@@ -83,7 +83,7 @@ jobs:
       - name: Clone Source Code
         run: |
           chmod +x ./nn6000v2/scripts/update.sh
-          chmod +x ./nn6000v2/scripts/build.sh
+          chmod +x ./nn6000v2/scripts/build_multi.sh
 
           echo "克隆仓库：${{ env.REPO_URL }} 分支：${{ env.REPO_BRANCH }}"
           git clone --depth 1 -b ${{ env.REPO_BRANCH }} ${{ env.REPO_URL }} ./action_build
@@ -138,7 +138,7 @@ jobs:
             echo "开始编译设备：$DEV"
             echo "=============================================="
 
-            SKIP_CLEAN=1 ./nn6000v2/scripts/build.sh "$DEV"
+            SKIP_CLEAN=1 ./nn6000v2/scripts/build_multi.sh "$DEV"
 
             OUT_DIR="./firmware/$DEV"
             mkdir -p "$OUT_DIR"
